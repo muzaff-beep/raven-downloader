@@ -1,0 +1,563 @@
+name: Raven Multi-Tool Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: "One direct URL per line (maximum 10)"
+        required: true
+        type: string
+      output_name:
+        description: "Optional base name for the final artifact"
+        required: false
+        default: "raven-download"
+        type: string
+      downloader:
+        description: "Preferred downloader"
+        required: true
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - aria2
+          - curl
+          - wget
+          - yt-dlp
+          - python
+      user_agent:
+        description: "Optional User-Agent header"
+        required: false
+        default: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131 Safari/537.36"
+        type: string
+      referer:
+        description: "Optional Referer header"
+        required: false
+        type: string
+      cookies:
+        description: "Optional Cookie header. Prefer using the RAVEN_COOKIES repository secret."
+        required: false
+        type: string
+      extra_headers:
+        description: "Optional headers, one per line, for example: Authorization: Bearer TOKEN"
+        required: false
+        type: string
+      connections:
+        description: "aria2 connections per file"
+        required: true
+        default: "8"
+        type: choice
+        options:
+          - "1"
+          - "4"
+          - "8"
+          - "16"
+      retries:
+        description: "Retry count"
+        required: true
+        default: "5"
+        type: choice
+        options:
+          - "2"
+          - "3"
+          - "5"
+          - "10"
+      timeout:
+        description: "Network timeout in seconds"
+        required: true
+        default: "60"
+        type: string
+      archive:
+        description: "Archive downloaded files"
+        required: true
+        default: "7z"
+        type: choice
+        options:
+          - none
+          - zip
+          - 7z
+          - tar.gz
+      split_size:
+        description: "Optional archive volume size, such as 1900m or 95m. Leave empty for no splitting."
+        required: false
+        default: ""
+        type: string
+      checksum_type:
+        description: "Optional checksum algorithm"
+        required: true
+        default: "none"
+        type: choice
+        options:
+          - none
+          - sha256
+          - sha512
+          - md5
+      checksum:
+        description: "Expected checksum; only supported when downloading one URL"
+        required: false
+        type: string
+      retention_days:
+        description: "Artifact retention period"
+        required: true
+        default: "7"
+        type: choice
+        options:
+          - "1"
+          - "3"
+          - "7"
+          - "14"
+          - "30"
+          - "60"
+          - "90"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: raven-downloader-${{ github.ref }}-${{ github.actor }}
+  cancel-in-progress: false
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+
+    env:
+      URLS: ${{ inputs.urls }}
+      OUTPUT_NAME: ${{ inputs.output_name }}
+      DOWNLOADER: ${{ inputs.downloader }}
+      USER_AGENT: ${{ inputs.user_agent }}
+      REFERER: ${{ inputs.referer }}
+      INPUT_COOKIES: ${{ inputs.cookies }}
+      SECRET_COOKIES: ${{ secrets.RAVEN_COOKIES }}
+      EXTRA_HEADERS: ${{ inputs.extra_headers }}
+      CONNECTIONS: ${{ inputs.connections }}
+      RETRIES: ${{ inputs.retries }}
+      NETWORK_TIMEOUT: ${{ inputs.timeout }}
+      ARCHIVE: ${{ inputs.archive }}
+      SPLIT_SIZE: ${{ inputs.split_size }}
+      CHECKSUM_TYPE: ${{ inputs.checksum_type }}
+      EXPECTED_CHECKSUM: ${{ inputs.checksum }}
+
+    steps:
+      - name: Prepare tools
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y aria2 curl wget p7zip-full zip jq file
+          python3 -m pip install --upgrade pip requests yt-dlp
+          mkdir -p downloads output logs
+          df -h
+
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          mapfile -t CLEAN_URLS < <(
+            printf '%s\n' "$URLS" |
+              sed 's/\r$//' |
+              sed '/^[[:space:]]*$/d'
+          )
+
+          count="${#CLEAN_URLS[@]}"
+          if (( count == 0 )); then
+            echo "::error::No URLs were supplied."
+            exit 1
+          fi
+
+          if (( count > 10 )); then
+            echo "::error::A maximum of 10 URLs is allowed."
+            exit 1
+          fi
+
+          for url in "${CLEAN_URLS[@]}"; do
+            case "$url" in
+              http://*|https://*|ftp://*) ;;
+              *)
+                echo "::error::Unsupported URL: $url"
+                exit 1
+                ;;
+            esac
+          done
+
+          if [[ -n "$EXPECTED_CHECKSUM" && "$count" -ne 1 ]]; then
+            echo "::error::Checksum verification requires exactly one URL."
+            exit 1
+          fi
+
+          if ! [[ "$NETWORK_TIMEOUT" =~ ^[0-9]+$ ]] || (( NETWORK_TIMEOUT < 1 )); then
+            echo "::error::Timeout must be a positive integer."
+            exit 1
+          fi
+
+          if [[ -n "$SPLIT_SIZE" ]] && ! [[ "$SPLIT_SIZE" =~ ^[0-9]+[kKmMgG]?$ ]]; then
+            echo "::error::Split size must look like 95m, 1900m, 2g, or 500000."
+            exit 1
+          fi
+
+          printf '%s\n' "${CLEAN_URLS[@]}" > urls.txt
+          echo "url_count=$count" >> "$GITHUB_ENV"
+
+      - name: Build request options
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          COOKIE_VALUE="$INPUT_COOKIES"
+          if [[ -z "$COOKIE_VALUE" ]]; then
+            COOKIE_VALUE="$SECRET_COOKIES"
+          fi
+
+          : > curl_headers.txt
+          : > wget_headers.txt
+          : > aria_headers.txt
+          : > ytdlp_headers.txt
+
+          add_header() {
+            local header="$1"
+            [[ -z "$header" ]] && return 0
+            printf '%s\n' "$header" >> curl_headers.txt
+            printf '%s\n' "$header" >> wget_headers.txt
+            printf '%s\n' "$header" >> aria_headers.txt
+            printf '%s\n' "$header" >> ytdlp_headers.txt
+          }
+
+          add_header "User-Agent: $USER_AGENT"
+          [[ -n "$REFERER" ]] && add_header "Referer: $REFERER"
+          [[ -n "$COOKIE_VALUE" ]] && add_header "Cookie: $COOKIE_VALUE"
+
+          if [[ -n "$EXTRA_HEADERS" ]]; then
+            while IFS= read -r header; do
+              header="${header%$'\r'}"
+              [[ -n "$header" ]] && add_header "$header"
+            done <<< "$EXTRA_HEADERS"
+          fi
+
+      - name: Download files
+        id: download
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          success=0
+          failed=0
+          index=0
+          : > logs/results.tsv
+
+          safe_name() {
+            local name="$1"
+            name="${name%%\?*}"
+            name="${name%%\#*}"
+            name="$(basename "$name")"
+            name="$(printf '%s' "$name" | tr -cd '[:alnum:]._-')"
+            [[ -z "$name" || "$name" == "." || "$name" == ".." ]] && name="download.bin"
+            printf '%s' "$name"
+          }
+
+          header_args_curl=()
+          header_args_wget=()
+          header_args_aria=()
+          header_args_ytdlp=()
+
+          while IFS= read -r h; do
+            [[ -z "$h" ]] && continue
+            header_args_curl+=(-H "$h")
+            header_args_wget+=(--header="$h")
+            header_args_aria+=(--header="$h")
+            header_args_ytdlp+=(--add-header "$h")
+          done < curl_headers.txt
+
+          download_aria2() {
+            local url="$1" out="$2"
+            aria2c \
+              --continue=true \
+              --max-connection-per-server="$CONNECTIONS" \
+              --split="$CONNECTIONS" \
+              --min-split-size=1M \
+              --max-tries="$RETRIES" \
+              --retry-wait=5 \
+              --timeout="$NETWORK_TIMEOUT" \
+              --connect-timeout="$NETWORK_TIMEOUT" \
+              --auto-file-renaming=false \
+              --allow-overwrite=true \
+              --file-allocation=none \
+              "${header_args_aria[@]}" \
+              --dir=downloads \
+              --out="$out" \
+              "$url"
+          }
+
+          download_curl() {
+            local url="$1" out="$2"
+            curl \
+              --fail \
+              --location \
+              --retry "$RETRIES" \
+              --retry-all-errors \
+              --retry-delay 5 \
+              --connect-timeout "$NETWORK_TIMEOUT" \
+              --max-time 0 \
+              --continue-at - \
+              "${header_args_curl[@]}" \
+              --output "downloads/$out" \
+              "$url"
+          }
+
+          download_wget() {
+            local url="$1" out="$2"
+            wget \
+              --continue \
+              --tries="$RETRIES" \
+              --timeout="$NETWORK_TIMEOUT" \
+              --waitretry=5 \
+              "${header_args_wget[@]}" \
+              --output-document="downloads/$out" \
+              "$url"
+          }
+
+          download_ytdlp() {
+            local url="$1" out="$2"
+            yt-dlp \
+              --no-playlist \
+              --retries "$RETRIES" \
+              --fragment-retries "$RETRIES" \
+              --socket-timeout "$NETWORK_TIMEOUT" \
+              --continue \
+              "${header_args_ytdlp[@]}" \
+              --output "downloads/${out}.%(ext)s" \
+              "$url"
+          }
+
+          download_python() {
+            local url="$1" out="$2"
+            URL="$url" OUT="downloads/$out" \
+            RETRIES_PY="$RETRIES" TIMEOUT_PY="$NETWORK_TIMEOUT" \
+            python3 <<'PY'
+          import os, time, requests
+
+          url = os.environ["URL"]
+          out = os.environ["OUT"]
+          retries = int(os.environ["RETRIES_PY"])
+          timeout = int(os.environ["TIMEOUT_PY"])
+
+          headers = {}
+          with open("curl_headers.txt", "r", encoding="utf-8") as f:
+              for line in f:
+                  line = line.strip()
+                  if not line or ":" not in line:
+                      continue
+                  key, value = line.split(":", 1)
+                  headers[key.strip()] = value.strip()
+
+          last_error = None
+          for attempt in range(1, retries + 1):
+              try:
+                  with requests.get(
+                      url,
+                      headers=headers,
+                      stream=True,
+                      timeout=(timeout, timeout),
+                      allow_redirects=True,
+                  ) as response:
+                      response.raise_for_status()
+                      with open(out, "wb") as target:
+                          for chunk in response.iter_content(chunk_size=1024 * 1024):
+                              if chunk:
+                                  target.write(chunk)
+                  raise SystemExit(0)
+              except Exception as exc:
+                  last_error = exc
+                  if attempt < retries:
+                      time.sleep(5)
+          raise RuntimeError(f"Python requests failed: {last_error}")
+          PY
+          }
+
+          try_method() {
+            local method="$1" url="$2" out="$3"
+            echo "::group::$method — $url"
+            set +e
+            "download_$method" "$url" "$out" 2>&1 | tee "logs/${index}-${method}.log"
+            status=${PIPESTATUS[0]}
+            set -e
+            echo "::endgroup::"
+            return "$status"
+          }
+
+          while IFS= read -r url; do
+            index=$((index + 1))
+            base="$(safe_name "$url")"
+            out="$(printf '%02d-%s' "$index" "$base")"
+
+            methods=()
+            if [[ "$DOWNLOADER" == "auto" ]]; then
+              methods=(aria2 curl wget python yt-dlp)
+            else
+              methods=("$DOWNLOADER")
+            fi
+
+            downloaded=false
+            for method in "${methods[@]}"; do
+              case "$method" in
+                aria2|curl|wget|python|yt-dlp) ;;
+                *) continue ;;
+              esac
+
+              if try_method "$method" "$url" "$out"; then
+                downloaded=true
+                success=$((success + 1))
+                printf 'SUCCESS\t%s\t%s\t%s\n' "$method" "$url" "$out" >> logs/results.tsv
+                break
+              fi
+            done
+
+            if [[ "$downloaded" != true ]]; then
+              failed=$((failed + 1))
+              printf 'FAILED\t-\t%s\t%s\n' "$url" "$out" >> logs/results.tsv
+              echo "::warning::All download methods failed for $url"
+            fi
+          done < urls.txt
+
+          echo "success_count=$success" >> "$GITHUB_OUTPUT"
+          echo "failed_count=$failed" >> "$GITHUB_OUTPUT"
+
+          if (( success == 0 )); then
+            echo "::error::Every download failed."
+            exit 1
+          fi
+
+      - name: Inspect downloads
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          {
+            echo "# Downloaded files"
+            echo
+            echo '```text'
+            find downloads -maxdepth 1 -type f -printf '%f\t%s bytes\n' | sort
+            echo '```'
+            echo
+            echo "# Results"
+            echo
+            echo '```text'
+            cat logs/results.tsv
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          find downloads -maxdepth 1 -type f -exec file {} \;
+          du -h downloads/* || true
+          df -h
+
+      - name: Verify checksum
+        if: ${{ inputs.checksum_type != 'none' && inputs.checksum != '' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          file_path="$(find downloads -maxdepth 1 -type f | head -n 1)"
+          if [[ -z "$file_path" ]]; then
+            echo "::error::No downloaded file found for checksum verification."
+            exit 1
+          fi
+
+          case "$CHECKSUM_TYPE" in
+            sha256) actual="$(sha256sum "$file_path" | awk '{print $1}')" ;;
+            sha512) actual="$(sha512sum "$file_path" | awk '{print $1}')" ;;
+            md5) actual="$(md5sum "$file_path" | awk '{print $1}')" ;;
+            *)
+              echo "::error::Unsupported checksum type."
+              exit 1
+              ;;
+          esac
+
+          expected="$(printf '%s' "$EXPECTED_CHECKSUM" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+          actual="$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')"
+
+          if [[ "$actual" != "$expected" ]]; then
+            echo "::error::Checksum mismatch. Expected $expected, got $actual"
+            exit 1
+          fi
+
+          echo "Checksum verified: $CHECKSUM_TYPE" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Package output
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          clean_name="$(printf '%s' "$OUTPUT_NAME" | tr -cd '[:alnum:]._-')"
+          [[ -z "$clean_name" ]] && clean_name="raven-download"
+
+          case "$ARCHIVE" in
+            none)
+              cp -a downloads/. output/
+              ;;
+            zip)
+              if [[ -n "$SPLIT_SIZE" ]]; then
+                zip_size="$SPLIT_SIZE"
+                zip -r -s "$zip_size" "output/${clean_name}.zip" downloads logs
+              else
+                zip -r "output/${clean_name}.zip" downloads logs
+              fi
+              ;;
+            7z)
+              if [[ -n "$SPLIT_SIZE" ]]; then
+                7z a -mx=5 "-v${SPLIT_SIZE}b" "output/${clean_name}.7z" downloads logs
+              else
+                7z a -mx=5 "output/${clean_name}.7z" downloads logs
+              fi
+              ;;
+            tar.gz)
+              tar -czf "output/${clean_name}.tar.gz" downloads logs
+              if [[ -n "$SPLIT_SIZE" ]]; then
+                split -b "$SPLIT_SIZE" \
+                  -d -a 3 \
+                  "output/${clean_name}.tar.gz" \
+                  "output/${clean_name}.tar.gz.part-"
+                rm "output/${clean_name}.tar.gz"
+              fi
+              ;;
+            *)
+              echo "::error::Unknown archive type: $ARCHIVE"
+              exit 1
+              ;;
+          esac
+
+          find output -maxdepth 1 -type f -printf '%f\t%s bytes\n' | sort
+
+      - name: Upload result artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.output_name }}
+          path: output/*
+          if-no-files-found: error
+          retention-days: ${{ fromJSON(inputs.retention_days) }}
+          compression-level: 0
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.output_name }}-logs
+          path: |
+            logs/
+            urls.txt
+          if-no-files-found: warn
+          retention-days: ${{ fromJSON(inputs.retention_days) }}
+
+      - name: Final summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo
+            echo "# Raven summary"
+            echo
+            echo "- Successful downloads: ${{ steps.download.outputs.success_count || '0' }}"
+            echo "- Failed downloads: ${{ steps.download.outputs.failed_count || '0' }}"
+            echo "- Preferred downloader: \`${{ inputs.downloader }}\`"
+            echo "- Archive: \`${{ inputs.archive }}\`"
+            echo
+            echo "Download the result from the **Artifacts** section at the bottom of this workflow run."
+          } >> "$GITHUB_STEP_SUMMARY"
